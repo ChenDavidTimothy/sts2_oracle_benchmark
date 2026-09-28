@@ -1,0 +1,38 @@
+seed: 1234
+output_dir: runs/a0_smoke
+scene:
+  environment_rgb: [0.03, 0.04, 0.06]
+  reflector:
+    kind: quadratic
+    patch_half_extent: 1.15
+    kx: -0.16
+    ky: -0.10
+    ripple_amp: 0.0
+    ripple_freq: 2.5
+  camera:
+    center: [-0.72, 0.15, 2.65]
+    target: [0.0, 0.0, -0.02]
+    up: [0.0, 1.0, 0.0]
+    width: 128
+    height: 128
+    fov_y_deg: 44.0
+  surfaces:
+    - name: source
+      center: [0.78, 0.02, 2.05]
+      axis_u: [0.72, 0.0, 0.0]
+      axis_v: [0.0, 0.62, 0.0]
+      role: radiance
+      texture: sine
+      bandwidth: 8.0
+      constant_rgb: [0.8, 0.8, 0.8]
+benchmark:
+  methods: [exact_ewa, tiled_ewa, exact_tri, tiled_tri]
+  source_resolution: 32
+  tiles_per_axis: 8
+  raster_backend: auto
+  require_backend_parity: true
+  triangle_msaa: 4
+  warmup: 1
+  repeats: 2
+  depth_tol: 0.03
+  lpips: false

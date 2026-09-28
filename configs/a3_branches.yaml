@@ -1,0 +1,30 @@
+seed: 1234
+scene:
+  environment_rgb: [0.03, 0.04, 0.06]
+  reflector:
+    kind: ripple
+    patch_half_extent: 1.25
+    kx: 0.02
+    ky: -0.03
+    ripple_amp: 0.16
+    ripple_freq: 3.2
+  camera:
+    center: [-0.7, 0.10, 2.6]
+    target: [0.0, 0.0, 0.0]
+    up: [0.0, 1.0, 0.0]
+    width: 128
+    height: 128
+    fov_y_deg: 44.0
+  surfaces:
+    - name: source
+      center: [0.8, 0.0, 2.0]
+      axis_u: [0.65, 0.0, 0.0]
+      axis_v: [0.0, 0.55, 0.0]
+      role: radiance
+      texture: sine
+      bandwidth: 7.0
+      constant_rgb: [0.8, 0.8, 0.8]
+branch_benchmark:
+  anchor_grid: 5
+  seeds_per_axis: 7
+  camera_x: [-1.0, -0.8, -0.6, -0.4]

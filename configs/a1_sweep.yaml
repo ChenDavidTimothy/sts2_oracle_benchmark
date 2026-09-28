@@ -1,0 +1,40 @@
+seed: 1234
+output_dir: runs/a1_sweep
+scene:
+  environment_rgb: [0.03, 0.04, 0.06]
+  reflector:
+    kind: quadratic
+    patch_half_extent: 1.2
+    kx: -0.12
+    ky: -0.08
+    ripple_amp: 0.0
+    ripple_freq: 2.5
+  camera:
+    center: [-0.75, 0.12, 2.7]
+    target: [0.0, 0.0, -0.02]
+    up: [0.0, 1.0, 0.0]
+    width: 192
+    height: 192
+    fov_y_deg: 44.0
+  surfaces:
+    - name: source
+      center: [0.8, 0.0, 2.05]
+      axis_u: [0.75, 0.0, 0.0]
+      axis_v: [0.0, 0.65, 0.0]
+      role: radiance
+      texture: sine
+      bandwidth: 8.0
+      constant_rgb: [0.8, 0.8, 0.8]
+benchmark:
+  methods: [exact_ewa, tiled_ewa, exact_tri, tiled_tri]
+  source_resolution: 64
+  tiles_per_axis: 8
+  raster_backend: auto
+  warmup: 2
+  repeats: 5
+  depth_tol: 0.02
+  lpips: false
+sweep:
+  scene.reflector.kx: [-0.05, -0.12, -0.22]
+  scene.surfaces.0.bandwidth: [4.0, 8.0, 14.0]
+  benchmark.tiles_per_axis: [4, 8, 16]

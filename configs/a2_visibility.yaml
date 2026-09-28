@@ -1,0 +1,46 @@
+seed: 1234
+output_dir: runs/a2_visibility
+scene:
+  environment_rgb: [0.03, 0.04, 0.06]
+  reflector:
+    kind: quadratic
+    patch_half_extent: 1.2
+    kx: -0.14
+    ky: -0.10
+    ripple_amp: 0.0
+    ripple_freq: 2.5
+  camera:
+    center: [-0.72, 0.12, 2.65]
+    target: [0.0, 0.0, -0.02]
+    up: [0.0, 1.0, 0.0]
+    width: 192
+    height: 192
+    fov_y_deg: 44.0
+  surfaces:
+    - name: source
+      center: [0.88, 0.0, 2.2]
+      axis_u: [0.8, 0.0, 0.0]
+      axis_v: [0.0, 0.68, 0.0]
+      role: radiance
+      texture: checker
+      bandwidth: 10.0
+      constant_rgb: [0.8, 0.8, 0.8]
+    - name: black_occluder
+      center: [0.42, 0.05, 1.25]
+      axis_u: [0.30, 0.0, 0.0]
+      axis_v: [0.0, 0.42, 0.0]
+      role: depth_only
+      texture: constant
+      bandwidth: 1.0
+      constant_rgb: [0.0, 0.0, 0.0]
+benchmark:
+  methods: [exact_ewa, tiled_ewa, exact_tri, tiled_tri]
+  source_resolution: 64
+  tiles_per_axis: 12
+  raster_backend: auto
+  require_backend_parity: true
+  triangle_msaa: 4
+  warmup: 2
+  repeats: 5
+  depth_tol: 0.02
+  lpips: false
