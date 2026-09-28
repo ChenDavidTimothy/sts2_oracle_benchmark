@@ -1,0 +1,62 @@
+seed: 1234
+output_dir: runs/a1_adaptive_sweep
+scene:
+  environment_rgb: [0.03, 0.04, 0.06]
+  reflector:
+    kind: quadratic
+    patch_half_extent: 1.2
+    kx: -0.12
+    ky: -0.08
+    ripple_amp: 0.0
+    ripple_freq: 2.5
+  camera:
+    center: [-0.75, 0.12, 2.7]
+    target: [0.0, 0.0, -0.02]
+    up: [0.0, 1.0, 0.0]
+    width: 192
+    height: 192
+    fov_y_deg: 44.0
+  surfaces:
+    - name: source
+      center: [0.8, 0.0, 2.05]
+      axis_u: [0.75, 0.0, 0.0]
+      axis_v: [0.0, 0.65, 0.0]
+      role: radiance
+      texture: sine
+      bandwidth: 8.0
+      constant_rgb: [0.8, 0.8, 0.8]
+benchmark:
+  methods: [exact_tri_uv, adaptive_newton_tri_uv]
+  source_resolution: 64
+  raster_backend: auto
+  require_backend_parity: false
+  source_filter_taps: 4
+  triangle_msaa: 1
+  warmup: 0
+  repeats: 1
+  depth_tol: 0.02
+  lpips: false
+  adaptive:
+    base_tiles_per_axis: 4
+    max_depth: 5
+    screen_error_px: 0.10
+    depth_error: 0.0015
+    root_error_px: 0.025
+    source_uv_error: 0.002
+    radiance_error: 0.02
+    max_kappa_fu: 100000.0
+    min_sigma_jphi: 0.0001
+    min_abs_det_jphi: 0.000001
+    newton_corrections: 1
+    max_leaf_tiles: 20000
+    validate_exact_probes: false
+    validation_stride: 8
+sweep:
+  scene.camera.center:
+    - [-1.0, 0.12, 2.7]
+    - [-0.50, 0.12, 2.7]
+  scene.reflector.kx: [-0.06, -0.20]
+  scene.surfaces.0.center:
+    - [0.8, 0.0, 1.65]
+    - [0.8, 0.0, 2.55]
+  scene.surfaces.0.bandwidth: [4.0, 14.0]

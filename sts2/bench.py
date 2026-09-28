@@ -17,7 +17,8 @@ import yaml
 
 from .metrics import psnr, ssim, depth_agreement, visibility_metrics, radiance_hit_mask, maybe_lpips
 from .ray_reference import render_reference
-from .render import render_ewa, render_triangles
+from .render import render_ewa, render_triangles, render_uv_triangles
+from .adaptive import AdaptiveTransportConfig
 from .scenes import scene_from_config, expand_sweep
 from .utils import save_image, save_json, seed_all, timed
 from raster import has_cupy_cuda
@@ -78,6 +79,8 @@ def _run_one(cfg: dict, out_dir: Path, device: torch.device) -> list[dict]:
     tiles = int(cfg["benchmark"].get("tiles_per_axis", 8))
     backend = cfg["benchmark"].get("raster_backend", "auto")
     lpips_enabled = bool(cfg["benchmark"].get("lpips", False))
+    filter_taps = int(cfg["benchmark"].get("source_filter_taps", 4))
+    adaptive_base = AdaptiveTransportConfig(**cfg["benchmark"].get("adaptive", {}))
     msaa = int(cfg["benchmark"].get("triangle_msaa", 1))
     if msaa not in (1, 4):
         raise ValueError("triangle_msaa must be 1 or 4")
@@ -108,6 +111,26 @@ def _run_one(cfg: dict, out_dir: Path, device: torch.device) -> list[dict]:
             return render_triangles(active.reflector, active.camera, active.surfaces, mask, n_cells=n, mode="exact", backend=chosen_backend, environment_rgb=scene.environment_rgb)
         if method == "tiled_tri":
             return render_triangles(active.reflector, active.camera, active.surfaces, mask, n_cells=n, mode="tiled", tiles_per_axis=tiles, backend=chosen_backend, environment_rgb=scene.environment_rgb)
+        if method == "exact_tri_uv":
+            return render_uv_triangles(
+                active.reflector, active.camera, active.surfaces, mask,
+                mode="exact", n_cells=n, backend=chosen_backend,
+                environment_rgb=scene.environment_rgb, filter_taps=filter_taps,
+            )
+        if method == "adaptive_pred_tri_uv":
+            acfg = replace(adaptive_base, newton_corrections=0)
+            return render_uv_triangles(
+                active.reflector, active.camera, active.surfaces, mask,
+                mode="adaptive", adaptive_cfg=acfg, backend=chosen_backend,
+                environment_rgb=scene.environment_rgb, filter_taps=filter_taps,
+            )
+        if method == "adaptive_newton_tri_uv":
+            acfg = replace(adaptive_base, newton_corrections=1)
+            return render_uv_triangles(
+                active.reflector, active.camera, active.surfaces, mask,
+                mode="adaptive", adaptive_cfg=acfg, backend=chosen_backend,
+                environment_rgb=scene.environment_rgb, filter_taps=filter_taps,
+            )
         raise ValueError(f"unknown method: {method}")
 
     for method in methods:
@@ -135,7 +158,15 @@ def _run_one(cfg: dict, out_dir: Path, device: torch.device) -> list[dict]:
         }
         row.update(visibility_metrics(result.depth, reference.first_hit_tau, result.first_hit_surface, reference.first_hit_surface, reference.mirror_mask, tol=cfg["benchmark"].get("depth_tol", 0.02), surface_roles=roles))
         row.update(result.stats)
-        if method.endswith("tri") and msaa == 4:
+        if method.startswith("adaptive_") and bool(cfg["benchmark"].get("require_adaptive_tolerance", False)):
+            exhausted = int(result.stats.get("adaptive_tolerance_exhausted_tiles", 0))
+            topology_violations = int(result.stats.get("adaptive_final_topology_tolerance_violations", 0))
+            if exhausted or topology_violations:
+                raise AssertionError(
+                    f"{method}: adaptive tolerance not satisfied "
+                    f"(exhausted_tiles={exhausted}, final_topology_violations={topology_violations})"
+                )
+        if (method.endswith("tri") or method.endswith("tri_uv")) and msaa == 4:
             hi = evaluate(method, high_res=True)
             anti = F.avg_pool2d(hi.image.permute(2,0,1)[None],2).squeeze(0).permute(1,2,0)
             anti_ref = F.avg_pool2d(msaa_ref.image.permute(2,0,1)[None],2).squeeze(0).permute(1,2,0)
@@ -169,6 +200,53 @@ def _run_one(cfg: dict, out_dir: Path, device: torch.device) -> list[dict]:
         rows.append(row)
         results[method] = result
         quality_rows[method] = row
+    if "exact_tri_uv" in results:
+        exact_uv = results["exact_tri_uv"]
+        for candidate_name in ("adaptive_pred_tri_uv", "adaptive_newton_tri_uv"):
+            if candidate_name not in results:
+                continue
+            candidate = results[candidate_name]
+            common = radiance_hit_mask(exact_uv.first_hit_surface, roles) & radiance_hit_mask(candidate.first_hit_surface, roles)
+            union = radiance_hit_mask(exact_uv.first_hit_surface, roles) | radiance_hit_mask(candidate.first_hit_surface, roles)
+            row = quality_rows[candidate_name]
+            prefix = "direct_adaptive_vs_exact_uv"
+            row[f"{prefix}_psnr_common_hit"] = psnr(candidate.image, exact_uv.image, common)
+            row[f"{prefix}_psnr_union_hit"] = psnr(candidate.image, exact_uv.image, union)
+            row[f"{prefix}_max_abs_union_hit"] = float((candidate.image - exact_uv.image).abs()[union].max()) if bool(union.any()) else float("nan")
+            row[f"{prefix}_radiance_mask_disagreement"] = int((radiance_hit_mask(exact_uv.first_hit_surface, roles) != radiance_hit_mask(candidate.first_hit_surface, roles)).sum().item())
+            direct_vis = visibility_metrics(
+                candidate.depth,
+                exact_uv.depth,
+                candidate.first_hit_surface,
+                exact_uv.first_hit_surface,
+                reference.mirror_mask,
+                tol=cfg["benchmark"].get("depth_tol", 0.02),
+                surface_roles=roles,
+            )
+            for key, value in direct_vis.items():
+                row[f"{prefix}_{key}"] = value
+
+            def reduction_ratio(stat: str) -> float:
+                ref_value = float(exact_uv.stats.get(stat, 0))
+                candidate_value = float(candidate.stats.get(stat, 0))
+                if candidate_value <= 0.0:
+                    return float("inf") if ref_value > 0.0 else float("nan")
+                return ref_value / candidate_value
+
+            for stat in (
+                "exact_anchor_solves",
+                "generated_vertices",
+                "generated_triangles",
+                "indexed_mesh_payload_bytes",
+                "dynamic_raster_payload_bytes",
+                "pixel_touches",
+            ):
+                row[f"{prefix}_{stat}_reduction_x"] = reduction_ratio(stat)
+            if "exact_tri_uv" in msaa_images and candidate_name in msaa_images:
+                union_msaa = msaa_radiance_masks["exact_tri_uv"] | msaa_radiance_masks[candidate_name]
+                row[f"{prefix}_psnr_msaa4_union_hit"] = psnr(msaa_images[candidate_name], msaa_images["exact_tri_uv"], union_msaa)
+            save_image(out_dir / f"{candidate_name}_vs_exact_tri_uv_absdiff.png", ((candidate.image - exact_uv.image).abs()*5).clamp(0,1))
+
     if "exact_tri" in results and "tiled_tri" in results:
         exact = results["exact_tri"]
         tiled = results["tiled_tri"]

@@ -1,0 +1,62 @@
+seed: 1234
+output_dir: runs/a2_adaptive_visibility
+scene:
+  environment_rgb: [0.03, 0.04, 0.06]
+  reflector:
+    kind: quadratic
+    patch_half_extent: 1.2
+    kx: -0.14
+    ky: -0.10
+    ripple_amp: 0.0
+    ripple_freq: 2.5
+  camera:
+    center: [-0.72, 0.12, 2.65]
+    target: [0.0, 0.0, -0.02]
+    up: [0.0, 1.0, 0.0]
+    width: 192
+    height: 192
+    fov_y_deg: 44.0
+  surfaces:
+    - name: source
+      center: [0.88, 0.0, 2.2]
+      axis_u: [0.8, 0.0, 0.0]
+      axis_v: [0.0, 0.68, 0.0]
+      role: radiance
+      texture: checker
+      bandwidth: 10.0
+      constant_rgb: [0.8, 0.8, 0.8]
+    - name: black_occluder
+      center: [0.42, 0.05, 1.25]
+      axis_u: [0.30, 0.0, 0.0]
+      axis_v: [0.0, 0.42, 0.0]
+      role: depth_only
+      texture: constant
+      bandwidth: 1.0
+      constant_rgb: [0.0, 0.0, 0.0]
+benchmark:
+  methods: [exact_tri_uv, adaptive_newton_tri_uv]
+  source_resolution: 64
+  raster_backend: auto
+  require_backend_parity: true
+  require_adaptive_tolerance: true
+  source_filter_taps: 4
+  triangle_msaa: 1
+  warmup: 1
+  repeats: 2
+  depth_tol: 0.02
+  lpips: false
+  adaptive:
+    base_tiles_per_axis: 6
+    max_depth: 5
+    screen_error_px: 0.08
+    depth_error: 0.001
+    root_error_px: 0.02
+    source_uv_error: 0.0015
+    radiance_error: 0.02
+    max_kappa_fu: 100000.0
+    min_sigma_jphi: 0.0001
+    min_abs_det_jphi: 0.000001
+    newton_corrections: 1
+    max_leaf_tiles: 30000
+    validate_exact_probes: true
+    validation_stride: 8

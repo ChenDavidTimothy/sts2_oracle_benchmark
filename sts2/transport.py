@@ -96,6 +96,33 @@ def specular_terms(
     }
 
 
+def _solve_linear(a: Tensor, b: Tensor) -> Tensor:
+    """Solve a small batched linear system with a least-squares fallback."""
+    try:
+        return torch.linalg.solve(a, b)
+    except RuntimeError:
+        return torch.linalg.lstsq(a, b).solution
+
+
+def newton_correct(
+    reflector: HeightFieldReflector,
+    surface: PlaneSurface,
+    s: Tensor,
+    camera_center: Tensor,
+    u: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Apply exactly one Newton correction to the stationary-path constraint.
+
+    Returns (u_next, du). No line search or patch clamp is applied: this is the
+    fixed production correction used by STS-2.1. Callers must run the physical
+    validity / conditioning gates afterwards.
+    """
+    q = specular_terms(reflector, surface, u, s, camera_center)
+    eye2 = torch.eye(2, device=u.device, dtype=u.dtype).expand_as(q["F_u"])
+    du = _solve_linear(q["F_u"] + 1e-10 * eye2, -q["F"][..., None]).squeeze(-1)
+    return u + du, du
+
+
 def planar_initial_guess(
     reflector: HeightFieldReflector,
     surface: PlaneSurface,
@@ -146,10 +173,7 @@ def solve_specular(
         fu = q["F_u"]
         # Small Tikhonov term only for numerical solving; diagnostics use the unregularized matrix.
         reg = 1e-10 * eye2.expand_as(fu)
-        try:
-            du = torch.linalg.solve(fu + reg, -f[..., None]).squeeze(-1)
-        except RuntimeError:
-            du = torch.linalg.lstsq(fu + reg, -f[..., None]).solution.squeeze(-1)
+        du = _solve_linear(fu + reg, -f[..., None]).squeeze(-1)
 
         # Vectorized backtracking over four damping candidates.
         alphas = torch.tensor([1.0, 0.5, 0.25, 0.125, damping_floor], device=u.device, dtype=u.dtype)
@@ -183,8 +207,8 @@ def differentials(
     fu, fs, fc = q["F_u"], q["F_s"], q["F_c"]
     eye2 = torch.eye(2, device=s.device, dtype=s.dtype).expand_as(fu)
     fu_reg = fu + 1e-10 * eye2
-    j_us = -torch.linalg.solve(fu_reg, fs)
-    j_uc = -torch.linalg.solve(fu_reg, fc)
+    j_us = -_solve_linear(fu_reg, fs)
+    j_uc = -_solve_linear(fu_reg, fc)
     j_pi = camera.jacobian(q["x"])
     j_phi = torch.einsum("...ij,...jk,...kl->...il", j_pi, q["jx"], j_us)
     tau = q["r_y"]

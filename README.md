@@ -1,5 +1,111 @@
 # STS-2 Oracle Geometry Benchmark
 
+## v0.2.0: adaptive UV transport experiment
+
+v0.2.0 implements the next falsification experiment after the saved v0.1.1 results. It preserves every legacy renderer and adds a separate path that turns transport coherence into an adaptive reflected mesh instead of only reducing root solves.
+
+The new primary comparison is:
+
+```text
+analytic reflected-ray reference
+        |
+        +-- dense exact-root UV microtriangles        exact_tri_uv
+        |
+        +-- adaptive Taylor UV microtriangles         adaptive_pred_tri_uv
+        |
+        +-- adaptive Taylor + 1 Newton UV triangles   adaptive_newton_tri_uv
+```
+
+The UV paths carry source coordinates and reflected depth, not vertex RGB. First-hit visibility is resolved in `tau`, then the winning source field is sampled per fragment. The same source field and filter are therefore shared by dense exact and adaptive transport.
+
+### What changed mathematically
+
+For each adaptive tile, v0.2.0 solves one exact stationary-path anchor and evaluates `J_us`. Generated vertices use
+
+```text
+u_pred = u0 + J_us (s - s0)
+```
+
+and the Newton mode applies exactly one undamped production correction
+
+```text
+u_1 = u_pred - F_u(u_pred)^-1 F(u_pred).
+```
+
+The adaptive criterion deliberately separates five errors:
+
+1. remaining root error, estimated by the *next* Newton displacement projected to screen;
+2. screen-warp interpolation error, measured between a corrected probe and the actual piecewise-affine triangle map;
+3. reflected-depth interpolation error, measured using the screen-space barycentrics the rasterizer will actually use;
+4. inverse-map source-coordinate error, `||s - s_hat||`, at the physical probe pixel;
+5. source-radiance error between the physical probe and the raster-reconstructed source coordinate.
+
+This separation matters because one Newton correction can make vertex root error locally `O(h^4)` while an affine screen triangle remains generically `O(h^2)` in its interior.
+
+Tiles also split on physical validity, `kappa(F_u)`, `sigma_min(J_phi)`, small `|det J_phi|`, and local orientation changes. At maximum depth unresolved/singular tiles are reported rather than silently hidden.
+
+### Conforming mesh
+
+Adaptive leaves are triangulated through a shared dyadic source-coordinate lattice. Neighboring leaves share cached boundary vertices. When a coarse leaf borders finer leaves its boundary includes the hanging vertices and is triangulated as a polygon fan, preventing T-junction cracks. Emitted shared vertices use the finest incident tile's predictor before the optional one-step Newton correction. Because those transition fans differ from the cell's simple two-triangle estimator, v0.2.0 also probes the final emitted triangles and reports `adaptive_final_topology_tolerance_violations`. The smoke configuration treats any such violation as a hard failure.
+
+### Appearance
+
+`exact_tri_uv` and both adaptive modes rasterize `(p, tau, s)`. The UV rasterizer returns the winning source coordinate and the affine `ds/dp` footprint. `PlaneSurface.radiance_filtered()` then evaluates the procedural shared appearance field with 1, 4, or 9 deterministic footprint taps. This removes the v0.1.1 coupling between source texture bandwidth and baked vertex RGB.
+
+### New diagnostics
+
+Adaptive runs report, among other fields:
+
+- `exact_anchor_solves`;
+- `adaptation_production_newton_corrections`;
+- `adaptation_estimator_newton_corrections`;
+- `emitted_vertex_newton_corrections`;
+- `total_newton_linear_solves`;
+- `generated_vertices`, `generated_triangles`, `invalid_triangles`;
+- estimated root-screen, triangle-screen, triangle-depth, source-UV, and radiance p50/p95/p99/max errors;
+- final emitted-transition-triangle probe errors and tolerance-violation counts;
+- optional fully re-solved validation-probe versions of the cell-level errors;
+- `max_kappa_fu`, `min_sigma_min_jphi`, `min_abs_det_jphi`;
+- `pixel_touches`, `depth_only_pixel_touches`;
+- `indexed_mesh_payload_bytes` and `dynamic_raster_payload_bytes`.
+
+`persistent_transport_bytes` is zero for these oracle modes because the adaptive transport mesh is generated per view. The existing payload byte metrics remain working-state diagnostics, not end-to-end NVS model-size claims.
+
+### New run order
+
+Start with the small correctness/configuration run:
+
+```bash
+./scripts/run_a1_smoke.sh
+```
+
+Then run the actual multi-view/source-distance/curvature/bandwidth sweep:
+
+```bash
+./scripts/run_a1.sh
+```
+
+The sweep varies camera center, reflector curvature, source distance, and source bandwidth. It writes the usual metrics plus adaptive triangle-count and anchor-count plots.
+
+Only after A1 is credible, run adaptive reflected visibility closure:
+
+```bash
+./scripts/run_a2_adaptive.sh
+```
+
+The legacy v0.1.1 A0/A2/A3 configurations remain available for regression.
+
+### Timing limitation
+
+The adaptive mesh builder is intentionally a correctness-first Python control implementation. It performs adaptive control flow and mesh assembly on the host and is **not** an optimized throughput implementation. `frame_ms` is useful for detecting pathological work growth, but it must not be used to claim an STS speed win or loss against hardware BVH rays. The hard runtime comparison still requires a fused CUDA/graphics implementation and a genuine RTX/OptiX/DXR-style one-bounce baseline on identical geometry/filtering/visibility semantics.
+
+### Validation status
+
+v0.2.0 was prepared by static inspection and syntax validation only. The v0.1.1 numerical results below are saved prior evidence. No v0.2.0 renderer, test, benchmark, or training job was executed while producing this patch.
+
+---
+
+
 This repository is the **first falsification implementation** of the frozen STS-2 mathematics from the design discussion.
 
 It is deliberately **not** a complete learned 3DGS replacement. It implements the experiment that should be run *before* spending time on source inference, learned reflective geometry, rough BRDFs, or a full CUDA renderer.
@@ -17,11 +123,11 @@ The benchmark asks one narrow question:
 - Uniform tiled first-order transport, one exact root per tile anchor.
 - Per-pixel analytic reflected-ray reference renderer.
 - Experimental EWA source-splat renderer; Gaussian support currently extends beyond bounded source silhouettes.
-- Warped microtriangle renderer, the primary oracle path.
+- Legacy RGB-baked warped microtriangles plus the v0.2.0 UV-carrying exact/adaptive microtriangle path.
 - Separate reflected-depth buffer, including depth-only occluder surfaces.
 - Pure-PyTorch raster fallback.
 - Optional CuPy/NVRTC CUDA kernels for EWA and triangle depth/color rasterization.
-- Stage A1 parameter sweeps.
+- Legacy v0.1.1 uniform-tile A1 plus v0.2.0 adaptive UV A1 configurations.
 - Stage A3 multistart branch-count diagnostic on mixed-curvature reflectors.
 - Whole-mirror and source-hit/union-hit PSNR, direct tiled-versus-exact triangle quality, reflected-hit precision/recall/F1, matched-depth error, first-hit surface/role agreement, timing, root counts, tile error estimate, triangle/sample counts, and raster pixel-touch counts.
 - Prototype byte diagnostics: `transport_anchor_payload_bytes` (camera-frame anchor/Jacobian payload proxy) and `dynamic_raster_payload_bytes` (generated raster working-set payload). These are **not** encoded model-byte claims.
@@ -116,21 +222,9 @@ The relevant sanity checks are:
 - `triangle_msaa: 4` adds a separate 2x2 supersampled/downsampled triangle quality evaluation; its cost is excluded from `frame_ms`.
 - `psnr_ref_radiance_hit` measures quality on reference source-hit pixels; `psnr_radiance_union_hit` also includes predicted source coverage. `direct_tiled_vs_exact_tri_*` isolates transport error from source tessellation error. `psnr_reflect` remains a secondary whole-mirror diagnostic.
 
-### A1: curvature, texture bandwidth, tile-density sweep
+### Legacy v0.1.1 A1 configuration
 
-```bash
-./scripts/run_a1.sh
-```
-
-This sweeps:
-
-- reflector curvature;
-- source texture bandwidth;
-- number of transport tiles.
-
-It writes one CSV across the sweep and a time-vs-PSNR plot.
-
-The core question is whether tiled transport retains image quality while reducing exact root solves. Current timings include host synchronization and a prototype thread-per-primitive CuPy rasterizer; they cannot support a solve-versus-ray speed claim. The current A1 sweep does not vary camera position or source distance.
+`configs/a1_sweep.yaml` is retained only to reproduce the old uniform-tile experiment. `./scripts/run_a1.sh` now runs `configs/a1_adaptive_sweep.yaml`, described in the v0.2.0 section above. Do not use the legacy A1 CSV as evidence for the adaptive representation.
 
 ### A2: reflected-depth visibility closure
 
@@ -270,6 +364,9 @@ Current tests cover:
 - implicit `J_us` vs re-solved roots;
 - exact planar reflection point vs mirrored-source construction;
 - `O(h^2)` first-order transport error;
+- one-step Newton correction residual reduction;
+- UV first-hit rasterization and source-coordinate gradients;
+- adaptive indexed-mesh topology sanity;
 - small exact triangle render vs analytic ray reference.
 
 ## If the CuPy backend fails

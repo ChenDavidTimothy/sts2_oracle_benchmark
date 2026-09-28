@@ -143,6 +143,78 @@ extern "C" __global__ void tri_color(
     }
 }
 
+
+extern "C" __global__ void tri_uv_depth(
+    const float* p, const float* tau, const unsigned char* radmask,
+    const int ntri, const int H, const int W, float* depth,
+    unsigned long long* winner_key, unsigned long long* touches,
+    unsigned long long* depth_only_touches) {
+    int i = blockDim.x * blockIdx.x + threadIdx.x;
+    if (i >= ntri) return;
+    float ax=p[6*i+0], ay=p[6*i+1], bx=p[6*i+2], by=p[6*i+3], cx=p[6*i+4], cy=p[6*i+5];
+    int xmin=max(0, (int)floorf(fminf(ax,fminf(bx,cx))));
+    int xmax=min(W-1, (int)ceilf(fmaxf(ax,fmaxf(bx,cx))));
+    int ymin=max(0, (int)floorf(fminf(ay,fminf(by,cy))));
+    int ymax=min(H-1, (int)ceilf(fmaxf(ay,fmaxf(by,cy))));
+    for (int y=ymin; y<=ymax; ++y) for (int x=xmin; x<=xmax; ++x) {
+        float w0,w1,w2;
+        if (!bary((float)x,(float)y,ax,ay,bx,by,cx,cy,&w0,&w1,&w2)) continue;
+        float z=w0*tau[3*i+0]+w1*tau[3*i+1]+w2*tau[3*i+2];
+        if (!(z > 0.0f) || !isfinite(z)) continue;
+        int id=y*W+x;
+        atomicMin((unsigned int*)&depth[id], __float_as_uint(z));
+        unsigned long long key=((unsigned long long)__float_as_uint(z)<<32) | (unsigned int)i;
+        atomicMin(&winner_key[id], key);
+        atomicAdd(touches, 1ULL);
+        if (radmask[i] == 0) atomicAdd(depth_only_touches, 1ULL);
+    }
+}
+
+extern "C" __global__ void tri_uv_attr(
+    const float* p, const float* uv, const int ntri, const int H, const int W,
+    const unsigned long long* winner_key, float* out_uv, float* out_grad) {
+    int i = blockDim.x * blockIdx.x + threadIdx.x;
+    if (i >= ntri) return;
+    float ax=p[6*i+0], ay=p[6*i+1], bx=p[6*i+2], by=p[6*i+3], cx=p[6*i+4], cy=p[6*i+5];
+    float v0x=bx-ax, v0y=by-ay, v1x=cx-ax, v1y=cy-ay;
+    float den=v0x*v1y-v1x*v0y;
+    if (fabsf(den) < 1e-12f) return;
+    float du0=uv[6*i+2]-uv[6*i+0], du1=uv[6*i+4]-uv[6*i+0];
+    float dv0=uv[6*i+3]-uv[6*i+1], dv1=uv[6*i+5]-uv[6*i+1];
+    float j00=(du0*v1y-du1*v0y)/den;
+    float j01=(-du0*v1x+du1*v0x)/den;
+    float j10=(dv0*v1y-dv1*v0y)/den;
+    float j11=(-dv0*v1x+dv1*v0x)/den;
+    int xmin=max(0, (int)floorf(fminf(ax,fminf(bx,cx))));
+    int xmax=min(W-1, (int)ceilf(fmaxf(ax,fmaxf(bx,cx))));
+    int ymin=max(0, (int)floorf(fminf(ay,fminf(by,cy))));
+    int ymax=min(H-1, (int)ceilf(fmaxf(ay,fmaxf(by,cy))));
+    for (int y=ymin; y<=ymax; ++y) for (int x=xmin; x<=xmax; ++x) {
+        int id=y*W+x;
+        unsigned long long key=winner_key[id];
+        if (key == 0xffffffffffffffffULL || (unsigned int)(key & 0xffffffffULL) != (unsigned int)i) continue;
+        float w0,w1,w2;
+        if (!bary((float)x,(float)y,ax,ay,bx,by,cx,cy,&w0,&w1,&w2)) continue;
+        out_uv[2*id+0]=w0*uv[6*i+0]+w1*uv[6*i+2]+w2*uv[6*i+4];
+        out_uv[2*id+1]=w0*uv[6*i+1]+w1*uv[6*i+3]+w2*uv[6*i+5];
+        out_grad[4*id+0]=j00;
+        out_grad[4*id+1]=j01;
+        out_grad[4*id+2]=j10;
+        out_grad[4*id+3]=j11;
+    }
+}
+
+extern "C" __global__ void extract_uv_surface(
+    const unsigned long long* winner_key, const int* surface_ids,
+    const int ntri, const int n, int* first_id) {
+    int i = blockDim.x * blockIdx.x + threadIdx.x;
+    if (i >= n) return;
+    unsigned long long key=winner_key[i];
+    if (key == 0xffffffffffffffffULL) { first_id[i] = -1; return; }
+    unsigned int tri=(unsigned int)(key & 0xffffffffULL);
+    first_id[i] = tri < (unsigned int)ntri ? surface_ids[tri] : -1;
+}
+
 extern "C" __global__ void extract_id(const unsigned long long* first_key, int n, int* first_id) {
     int i = blockDim.x * blockIdx.x + threadIdx.x;
     if (i >= n) return;
@@ -267,3 +339,62 @@ def rasterize_triangles_cupy(
         depth=torch.where(mirror_mask,depth,torch.full_like(depth,float("inf")))
         first_id=torch.where(mirror_mask,first_id,-1)
     return img, depth, first_id, {"pixel_touches": int(touches.item()), "depth_only_pixel_touches": int(depth_only_touches.item())}
+
+
+def rasterize_uv_triangles_cupy(
+    tri_p: Tensor, tri_tau: Tensor, tri_uv: Tensor, tri_radiance_mask: Tensor,
+    height: int, width: int, mirror_mask: Tensor | None = None,
+    surface_ids: Tensor | None = None,
+):
+    """CUDA first-hit rasterizer for UV-carrying reflected microtriangles."""
+    if not available() or tri_p.device.type != "cuda":
+        raise RuntimeError("CuPy CUDA backend unavailable")
+    if tri_p.dtype != torch.float32 or tri_tau.dtype != torch.float32 or tri_uv.dtype != torch.float32:
+        raise ValueError("CuPy UV rasterizer currently requires float32")
+    n = tri_p.shape[0]
+    npix = height * width
+    depth = torch.full((npix,), float("inf"), device=tri_p.device, dtype=torch.float32)
+    winner_key = torch.full((npix,), -1, device=tri_p.device, dtype=torch.int64)
+    first_id = torch.full((npix,), -1, device=tri_p.device, dtype=torch.int32)
+    uv = torch.full((npix, 2), float("nan"), device=tri_p.device, dtype=torch.float32)
+    uv_grad = torch.zeros((npix, 2, 2), device=tri_p.device, dtype=torch.float32)
+    touches = torch.zeros((1,), device=tri_p.device, dtype=torch.int64)
+    depth_only_touches = torch.zeros((1,), device=tri_p.device, dtype=torch.int64)
+    if surface_ids is None:
+        surface_ids = torch.zeros((n,), device=tri_p.device, dtype=torch.int32)
+    else:
+        surface_ids = surface_ids.to(device=tri_p.device, dtype=torch.int32)
+    rad = tri_radiance_mask.to(torch.uint8)
+    mod = _module()
+    threads = 128
+    blocks = (n + threads - 1) // threads
+    if blocks:
+        shape_args = (np.int32(n), np.int32(height), np.int32(width))
+        _launch(
+            mod.get_function("tri_uv_depth"), blocks, threads,
+            (_cp(tri_p), _cp(tri_tau), _cp(rad), *shape_args, _cp(depth), _cp(winner_key), _cp(touches), _cp(depth_only_touches)),
+            tri_p.device,
+        )
+        _launch(
+            mod.get_function("tri_uv_attr"), blocks, threads,
+            (_cp(tri_p), _cp(tri_uv), *shape_args, _cp(winner_key), _cp(uv), _cp(uv_grad)),
+            tri_p.device,
+        )
+        _launch(
+            mod.get_function("extract_uv_surface"), (npix + threads - 1) // threads, threads,
+            (_cp(winner_key), _cp(surface_ids), np.int32(n), np.int32(npix), _cp(first_id)),
+            tri_p.device,
+        )
+    depth = depth.reshape(height, width)
+    first_id = first_id.reshape(height, width)
+    uv = uv.reshape(height, width, 2)
+    uv_grad = uv_grad.reshape(height, width, 2, 2)
+    if mirror_mask is not None:
+        depth = torch.where(mirror_mask, depth, torch.full_like(depth, float("inf")))
+        first_id = torch.where(mirror_mask, first_id, -1)
+        uv = torch.where(mirror_mask[..., None], uv, torch.full_like(uv, float("nan")))
+        uv_grad = torch.where(mirror_mask[..., None, None], uv_grad, torch.zeros_like(uv_grad))
+    return depth, first_id, uv, uv_grad, {
+        "pixel_touches": int(touches.item()),
+        "depth_only_pixel_touches": int(depth_only_touches.item()),
+    }

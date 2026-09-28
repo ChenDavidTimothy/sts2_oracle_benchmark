@@ -17,3 +17,9 @@ Reproduce the checks:
 ```
 
 The per-case directories contain image, depth, first-hit surface ID, and CSV artifacts. CUDA A0/A2 fail on backend mask, ID, or color disagreement. The run's `frame_ms` includes host/device barriers and a prototype thread-per-primitive rasterizer, so it is **not** solve-versus-ray or optimized-renderer performance evidence. The A1 multi-view/source-distance sweep and adaptive transport remain future work.
+
+# v0.2.0 validation status
+
+The v0.2.0 adaptive UV patch has **not** been numerically executed as part of its preparation. The constraint for this revision was to inspect and modify the code without rerunning the renderer/benchmark. Static Python compilation and patch-integrity checks may be performed, but any numerical or CUDA result must come from the target RTX 3060 Ti run and must be recorded separately.
+
+The first required runtime validation is `configs/a1_adaptive_smoke.yaml`. Do not interpret `frame_ms` as an optimized renderer comparison: the adaptive builder is correctness-first Python control code. The first hard claims to inspect are dense-exact versus adaptive UV image agreement, direct first-hit agreement, exact-anchor/triangle/payload reduction factors, estimator calibration, zero final-topology tolerance violations, and CuPy/Torch UV-raster parity.

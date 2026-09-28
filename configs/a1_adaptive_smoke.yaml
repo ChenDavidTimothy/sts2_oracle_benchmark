@@ -1,0 +1,54 @@
+seed: 1234
+output_dir: runs/a1_adaptive_smoke
+scene:
+  environment_rgb: [0.03, 0.04, 0.06]
+  reflector:
+    kind: quadratic
+    patch_half_extent: 1.15
+    kx: -0.16
+    ky: -0.10
+    ripple_amp: 0.0
+    ripple_freq: 2.5
+  camera:
+    center: [-0.72, 0.15, 2.65]
+    target: [0.0, 0.0, -0.02]
+    up: [0.0, 1.0, 0.0]
+    width: 128
+    height: 128
+    fov_y_deg: 44.0
+  surfaces:
+    - name: source
+      center: [0.78, 0.02, 2.05]
+      axis_u: [0.72, 0.0, 0.0]
+      axis_v: [0.0, 0.62, 0.0]
+      role: radiance
+      texture: sine
+      bandwidth: 8.0
+      constant_rgb: [0.8, 0.8, 0.8]
+benchmark:
+  methods: [exact_tri_uv, adaptive_pred_tri_uv, adaptive_newton_tri_uv]
+  source_resolution: 32
+  raster_backend: auto
+  require_backend_parity: true
+  require_adaptive_tolerance: true
+  source_filter_taps: 4
+  triangle_msaa: 1
+  warmup: 0
+  repeats: 1
+  depth_tol: 0.03
+  lpips: false
+  adaptive:
+    base_tiles_per_axis: 4
+    max_depth: 3
+    screen_error_px: 0.10
+    depth_error: 0.002
+    root_error_px: 0.025
+    source_uv_error: 0.002
+    radiance_error: 0.02
+    max_kappa_fu: 100000.0
+    min_sigma_jphi: 0.0001
+    min_abs_det_jphi: 0.000001
+    newton_corrections: 1
+    max_leaf_tiles: 5000
+    validate_exact_probes: true
+    validation_stride: 4

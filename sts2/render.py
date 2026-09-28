@@ -3,10 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import torch
 
-from raster import rasterize_ewa, rasterize_triangles
+from raster import rasterize_ewa, rasterize_triangles, rasterize_uv_triangles
 from .camera import PinholeCamera
 from .geometry import HeightFieldReflector, PlaneSurface, make_source_grid, grid_triangles
 from .tiles import transport_uniform_tiles
+from .adaptive import AdaptiveTransportConfig, build_adaptive_transport_mesh
 from .transport import solve_specular, differentials, specular_terms
 
 Tensor = torch.Tensor
@@ -157,3 +158,184 @@ def render_triangles(
     img,depth,first_id,rstats=rasterize_triangles(tp,tt,tc,tr,camera.height,camera.width,mirror_mask=mirror_mask,environment_rgb=environment_rgb,surface_ids=ids,backend=backend)
     stats.update(rstats)
     return RenderResult(img,depth,first_id,stats)
+
+
+def _merge_adaptive_stats(total: dict, part: dict) -> None:
+    """Aggregate per-surface adaptive diagnostics conservatively."""
+    min_keys = {"min_sigma_min_jphi", "min_abs_det_jphi"}
+    max_keys = {"max_kappa_fu", "adaptive_max_depth_reached"}
+    for key, value in part.items():
+        if not isinstance(value, (int, float)):
+            continue
+        if key in min_keys:
+            total[key] = min(total.get(key, float("inf")), value)
+        elif key in max_keys or key.endswith("_max") or "_p99" in key or "_p95" in key or "_p50" in key:
+            total[key] = max(total.get(key, float("-inf")), value)
+        else:
+            total[key] = total.get(key, 0) + value
+
+
+def _shade_uv_first_hits(
+    surfaces: list[PlaneSurface],
+    first_id: Tensor,
+    uv: Tensor,
+    uv_grad: Tensor,
+    mirror_mask: Tensor,
+    *,
+    environment_rgb: tuple[float, float, float],
+    filter_taps: int,
+) -> Tensor:
+    dtype = uv.dtype
+    device = uv.device
+    env = torch.tensor(environment_rgb, device=device, dtype=dtype)
+    image = env.expand(*first_id.shape, 3).clone()
+    has_hit = first_id >= 0
+    image[has_hit] = 0.0
+    for surface_id, surface in enumerate(surfaces):
+        if surface.role != "radiance":
+            continue
+        mask = first_id == surface_id
+        if not bool(mask.any()):
+            continue
+        image[mask] = surface.radiance_filtered(uv[mask], uv_grad[mask], taps=filter_taps)
+    image = torch.where(mirror_mask[..., None], image, torch.zeros_like(image))
+    return image
+
+
+def render_uv_triangles(
+    reflector: HeightFieldReflector,
+    camera: PinholeCamera,
+    surfaces: list[PlaneSurface],
+    mirror_mask: Tensor,
+    *,
+    mode: str,
+    n_cells: int = 64,
+    adaptive_cfg: AdaptiveTransportConfig | None = None,
+    backend: str = "auto",
+    environment_rgb=(0.03, 0.04, 0.06),
+    filter_taps: int = 4,
+) -> RenderResult:
+    """Render exact or adaptive reflected triangles carrying source coordinates.
+
+    Unlike render_triangles(), this path never bakes source RGB into vertices.
+    Visibility is resolved first in reflected depth, then the shared source field
+    is sampled per winning fragment using the affine source-coordinate footprint.
+    """
+    device = mirror_mask.device
+    dtype = torch.float32 if device.type == "cuda" else torch.float64
+    c, _, _, _, _ = camera.matrices(device=device, dtype=dtype)
+    all_tp: list[Tensor] = []
+    all_tt: list[Tensor] = []
+    all_ts: list[Tensor] = []
+    all_tr: list[Tensor] = []
+    all_ids: list[Tensor] = []
+    stats: dict[str, float | int] = {
+        "exact_anchor_solves": 0,
+        "validation_exact_solves": 0,
+        "source_vertices": 0,
+        "generated_vertices": 0,
+        "triangles": 0,
+        "generated_triangles": 0,
+        "invalid_triangles": 0,
+        "transport_anchor_payload_bytes": 0,
+        "dynamic_raster_payload_bytes": 0,
+        "indexed_mesh_payload_bytes": 0,
+        "persistent_transport_bytes": 0,
+        "source_filter_taps": filter_taps,
+    }
+
+    if mode == "adaptive" and adaptive_cfg is None:
+        adaptive_cfg = AdaptiveTransportConfig()
+
+    for surface_id, surf in enumerate(surfaces):
+        if mode == "exact":
+            s = make_source_grid(n_cells, device=device, dtype=dtype, vertices=True)
+            sol = solve_specular(reflector, surf, s, c)
+            u = sol.u
+            x, _, _ = reflector.eval(u)
+            p, z = camera.project(x)
+            y, _ = surf.eval(s)
+            tau = torch.linalg.vector_norm(y - x, dim=-1)
+            tri = grid_triangles(n_cells, device=device)
+            valid = sol.valid & (z > 0)
+            tv = valid[tri].all(dim=-1)
+            tp = p[tri][tv]
+            tt = tau[tri][tv]
+            ts = s[tri][tv]
+            stats["exact_anchor_solves"] += int(s.shape[0])
+            stats["source_vertices"] += int(s.shape[0])
+            stats["generated_vertices"] += int(s.shape[0])
+            stats["triangles"] += int(tv.sum().item())
+            stats["generated_triangles"] += int(tv.sum().item())
+            stats["invalid_triangles"] += int((~tv).sum().item())
+            stats["transport_anchor_payload_bytes"] += int(s.shape[0] * (2 + 4) * 4)
+            stats["indexed_mesh_payload_bytes"] += int(
+                s.numel() * s.element_size()
+                + p.numel() * p.element_size()
+                + tau.numel() * tau.element_size()
+                + tri.numel() * tri.element_size()
+            )
+        elif mode == "adaptive":
+            assert adaptive_cfg is not None
+            mesh = build_adaptive_transport_mesh(
+                reflector, surf, camera, adaptive_cfg, device=device, dtype=dtype
+            )
+            tri = mesh.triangles[mesh.triangle_valid]
+            tp = mesh.screen_vertices[tri]
+            tt = mesh.tau_vertices[tri]
+            ts = mesh.source_vertices[tri]
+            stats["source_vertices"] += int(mesh.source_vertices.shape[0])
+            stats["triangles"] += int(tri.shape[0])
+            stats["transport_anchor_payload_bytes"] += int(mesh.leaf_count * (2 + 2 + 4) * 4)
+            stats["indexed_mesh_payload_bytes"] += int(
+                mesh.source_vertices.numel() * mesh.source_vertices.element_size()
+                + mesh.screen_vertices.numel() * mesh.screen_vertices.element_size()
+                + mesh.tau_vertices.numel() * mesh.tau_vertices.element_size()
+                + mesh.triangles.numel() * mesh.triangles.element_size()
+            )
+            _merge_adaptive_stats(stats, mesh.stats)
+        else:
+            raise ValueError(f"unknown UV triangle mode: {mode}")
+
+        if tp.numel() == 0:
+            continue
+        rad = torch.full((tp.shape[0],), surf.role == "radiance", device=device, dtype=torch.bool)
+        ids = torch.full((tp.shape[0],), surface_id, device=device, dtype=torch.int32)
+        all_tp.append(tp.float())
+        all_tt.append(tt.float())
+        all_ts.append(ts.float())
+        all_tr.append(rad)
+        all_ids.append(ids)
+
+    if not all_tp:
+        env = torch.tensor(environment_rgb, device=device, dtype=torch.float32)
+        image = torch.where(mirror_mask[..., None], env.expand(*mirror_mask.shape, 3), torch.zeros((*mirror_mask.shape, 3), device=device, dtype=torch.float32))
+        return RenderResult(
+            image=image,
+            depth=torch.full(mirror_mask.shape, float("inf"), device=device, dtype=torch.float32),
+            first_hit_surface=torch.full(mirror_mask.shape, -1, device=device, dtype=torch.int32),
+            stats=stats,
+        )
+
+    tp = torch.cat(all_tp)
+    tt = torch.cat(all_tt)
+    ts = torch.cat(all_ts)
+    tr = torch.cat(all_tr)
+    ids = torch.cat(all_ids)
+    stats["dynamic_raster_payload_bytes"] = int(
+        sum(t.numel() * t.element_size() for t in (tp, tt, ts, tr, ids))
+    )
+    depth, first_id, uv, uv_grad, rstats = rasterize_uv_triangles(
+        tp, tt, ts, tr,
+        camera.height, camera.width,
+        mirror_mask=mirror_mask,
+        surface_ids=ids,
+        backend=backend,
+    )
+    stats.update(rstats)
+    image = _shade_uv_first_hits(
+        surfaces, first_id, uv, uv_grad, mirror_mask,
+        environment_rgb=environment_rgb,
+        filter_taps=filter_taps,
+    )
+    return RenderResult(image, depth, first_id, stats)

@@ -139,6 +139,34 @@ class PlaneSurface:
             return torch.stack((r, g, b), dim=-1).clamp(0.0, 1.0)
         raise ValueError(f"unknown texture: {self.texture}")
 
+    def radiance_filtered(self, s: Tensor, uv_grad: Tensor | None = None, taps: int = 1) -> Tensor:
+        """Sample the shared source field over an affine pixel footprint.
+
+        uv_grad[..., :, 0] and uv_grad[..., :, 1] are ds/dx and ds/dy.
+        The deterministic taps are a correctness-oriented approximation to box /
+        anisotropic filtering for the oracle benchmark. They deliberately do not
+        change the transport tessellation.
+        """
+        if taps == 1 or uv_grad is None:
+            return self.radiance(s)
+        if taps == 4:
+            offsets = ((-0.25, -0.25), (0.25, -0.25), (-0.25, 0.25), (0.25, 0.25))
+        elif taps == 9:
+            q = (-1.0 / 3.0, 0.0, 1.0 / 3.0)
+            offsets = tuple((x, y) for y in q for x in q)
+        else:
+            raise ValueError("filter taps must be one of 1, 4, or 9")
+        gx = uv_grad[..., :, 0]
+        gy = uv_grad[..., :, 1]
+        samples = torch.stack([s + ox * gx + oy * gy for ox, oy in offsets], dim=-2)
+        valid = self.in_bounds(samples)
+        rgb = self.radiance(samples)
+        w = valid.to(rgb.dtype)
+        denom = w.sum(dim=-1, keepdim=True)
+        filtered = (rgb * w[..., None]).sum(dim=-2) / denom.clamp_min(1.0)
+        center = self.radiance(s)
+        return torch.where(denom > 0, filtered, center)
+
 
 def make_source_grid(n: int, *, device: torch.device, dtype: torch.dtype, vertices: bool = False) -> Tensor:
     if vertices:

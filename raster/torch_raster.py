@@ -182,3 +182,87 @@ def rasterize_triangles_torch(
         depth_img = torch.where(mirror_mask, depth_img, torch.full_like(depth_img, float("inf")))
         first_id = torch.where(mirror_mask.reshape(-1), first_id, -1)
     return img, depth_img, first_id.reshape(height, width), {"pixel_touches": touches, "depth_only_pixel_touches": depth_only_touches}
+
+
+def _triangle_uv_jacobian(tri_p: Tensor, tri_uv: Tensor) -> Tensor:
+    """Return ds/dp for an affine screen-space triangle map."""
+    pmat = torch.stack((tri_p[:, 1] - tri_p[:, 0], tri_p[:, 2] - tri_p[:, 0]), dim=-1)
+    smat = torch.stack((tri_uv[:, 1] - tri_uv[:, 0], tri_uv[:, 2] - tri_uv[:, 0]), dim=-1)
+    return torch.matmul(smat, torch.linalg.pinv(pmat, rcond=1e-8))
+
+
+def rasterize_uv_triangles_torch(
+    tri_p: Tensor,
+    tri_tau: Tensor,
+    tri_uv: Tensor,
+    tri_radiance_mask: Tensor,
+    height: int,
+    width: int,
+    mirror_mask: Tensor | None = None,
+    chunk: int = 64,
+    surface_ids: Tensor | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, dict]:
+    """Rasterize first-hit depth and source coordinates without baking RGB.
+
+    Source coordinates are interpolated affinely in screen space. The returned
+    uv_grad is ds/dp per winning fragment and can be used for footprint-aware
+    source filtering after visibility has been resolved.
+    """
+    device, dtype = tri_p.device, tri_p.dtype
+    yy, xx = torch.meshgrid(
+        torch.arange(height, device=device, dtype=dtype),
+        torch.arange(width, device=device, dtype=dtype),
+        indexing="ij",
+    )
+    pixels = torch.stack((xx, yy), dim=-1).reshape(-1, 2)
+    npix = pixels.shape[0]
+    depth = torch.full((npix,), float("inf"), device=device, dtype=dtype)
+    first_id = torch.full((npix,), -1, device=device, dtype=torch.int32)
+    uv = torch.full((npix, 2), float("nan"), device=device, dtype=dtype)
+    uv_grad = torch.zeros((npix, 2, 2), device=device, dtype=dtype)
+    if surface_ids is None:
+        surface_ids = torch.zeros((tri_p.shape[0],), device=device, dtype=torch.int32)
+    touches = 0
+    depth_only_touches = 0
+
+    for start in range(0, tri_p.shape[0], chunk):
+        end = min(start + chunk, tri_p.shape[0])
+        tp = tri_p[start:end]
+        tt = tri_tau[start:end]
+        ts = tri_uv[start:end]
+        tr = tri_radiance_mask[start:end]
+        j_sp = _triangle_uv_jacobian(tp, ts)
+        w0, w1, w2, inside = _triangle_barycentric(tp, pixels)
+        z = w0 * tt[:, 0:1] + w1 * tt[:, 1:2] + w2 * tt[:, 2:3]
+        covered = inside & (z > 0) & torch.isfinite(z)
+        z = torch.where(covered, z, torch.full_like(z, float("inf")))
+        touches += int(covered.sum().item())
+        depth_only_touches += int((covered & ~tr[:, None]).sum().item())
+        zmin, arg = z.min(dim=0)
+        better = zmin < depth
+        if not bool(better.any()):
+            continue
+        pix_ids = torch.arange(npix, device=device)[better]
+        targ = arg[better]
+        wb0 = w0[targ, pix_ids]
+        wb1 = w1[targ, pix_ids]
+        wb2 = w2[targ, pix_ids]
+        suv = wb0[:, None] * ts[targ, 0] + wb1[:, None] * ts[targ, 1] + wb2[:, None] * ts[targ, 2]
+        depth[better] = zmin[better]
+        uv[better] = suv
+        uv_grad[better] = j_sp[targ]
+        first_id[better] = surface_ids[start:end][targ].to(torch.int32)
+
+    depth_img = depth.reshape(height, width)
+    first_img = first_id.reshape(height, width)
+    uv_img = uv.reshape(height, width, 2)
+    grad_img = uv_grad.reshape(height, width, 2, 2)
+    if mirror_mask is not None:
+        depth_img = torch.where(mirror_mask, depth_img, torch.full_like(depth_img, float("inf")))
+        first_img = torch.where(mirror_mask, first_img, -1)
+        uv_img = torch.where(mirror_mask[..., None], uv_img, torch.full_like(uv_img, float("nan")))
+        grad_img = torch.where(mirror_mask[..., None, None], grad_img, torch.zeros_like(grad_img))
+    return depth_img, first_img, uv_img, grad_img, {
+        "pixel_touches": touches,
+        "depth_only_pixel_touches": depth_only_touches,
+    }
